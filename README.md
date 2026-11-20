@@ -86,6 +86,53 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 `Release` 同时列出 `Packages` 与 `Packages.gz`：APT 2.6 以未压缩名识别
 索引目标，只列 `Packages.gz` 会被静默跳过（本项目最初即踩此坑）。
 
+## 双进程 /pool/ 下载与共享限速
+
+`apt-repo` 仍是唯一发版入口；在此之上，`docker-compose.yml` 还启动两个
+**相互独立**的下载进程 `pool-a`（宿主端口默认 `8081`）与 `pool-b`
+（默认 `8082`）。它们以只读方式挂载同一数据卷，直接对外提供 `/pool/`
+下的 `.deb` GET，两处均可独立访问：
+
+```bash
+curl -O http://127.0.0.1:8081/pool/main/s/smoke-one/smoke-one_1.0.0_amd64_<sha16>.deb
+curl -O http://127.0.0.1:8082/pool/main/s/smoke-one/smoke-one_1.0.0_amd64_<sha16>.deb
+```
+
+两处共用**同一个字节速率上限**（Compose 里的 `APT_REPO_RATE_BPS`，默认
+4 MiB/s），由共享卷 `apt-repo-limiter` 上的令牌桶状态协调
+（`app/ratelimit.py`：`flock` 保护的 `state.json`，跨进程读写）：
+
+| 语义 | 实现 |
+| --- | --- |
+| 任意时段内，两处提交给连接的包正文字节合计 ≤ 速率×时长 + 64 KiB | 全局令牌桶：容量 `APT_REPO_RATE_BURST`（默认 65536），按 `APT_REPO_RATE_BPS` 匀速补充；每个 32 KiB 分片写入连接前先从全局桶取票 |
+| 有正文可发的来源 IP 平分带宽 | 每个活跃来源 IP 一个公平桶，补充速率 = 上限 ÷ 活跃 IP 数 |
+| 同一 IP 连到两处也只占一份 | 公平桶按来源 IP  keyed，与该 IP 的连接数、所连进程无关 |
+| 只有一个来源持续接收时可用足上限 | 活跃 IP 数为 1 时，其公平桶补充速率即全量上限 |
+| 强杀一处后另一处在途下载继续，2 秒内可用空出的份额，共享上限始终生效 | 限流状态存在共享卷而非进程内存，进程死亡不影响幸存方；来源 IP 超过 `APT_REPO_RATE_ACTIVE_TTL`（默认 1 s）未取票即失去份额，幸存连接随即提速 |
+
+pool 服务的环境变量（`pool-a`/`pool-b` 必须一致，Compose 已统一注入）：
+
+| 环境变量 | 默认值 |
+| --- | --- |
+| `APT_REPO_RATE_BPS` | `4194304`（4 MiB/s） |
+| `APT_REPO_RATE_BURST` | `65536`（64 KiB） |
+| `APT_REPO_RATE_ACTIVE_TTL` | `1.0`（秒） |
+| `APT_REPO_LIMITER_DIR` | 容器内 `/limiter`（共享卷） |
+| `APT_REPO_POOL_PORT` | 容器内 `8081`；宿主映射 `APT_POOL_A_PORT`/`APT_POOL_B_PORT`（默认 `8081`/`8082`） |
+
+一键验证共享限速语义（发布三个大包 → 单源吃满 → 同源跨进程双连仍占一份
+→ 双源平分 → SIGKILL 一处后另一处在途下载继续且 2 秒内接管份额 →
+核对每个成功下载的 SHA-256 与全程字节上界）：
+
+```bash
+scripts/verify-shared-limit.sh          # 需要 docker compose v2
+KEEP=1 scripts/verify-shared-limit.sh   # 保留现场便于排查
+```
+
+脚本使用独立的 compose 项目（默认名 `aptrepo-limit-verify`，端口
+18080–18082）与两个客户端容器（两个来源 IP），不影响正常部署，结束后
+自动 `down -v` 清理。
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -117,6 +164,9 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 
 - **单写入进程**：发布通过进程内线程锁 + `flock` 串行化，`docker compose`
   固定 `--workers 1`。多副本部署时需改为共享存储上的分布式锁。
+- **限速器状态在共享卷**：`pool-a`/`pool-b` 通过 `apt-repo-limiter` 卷上的
+  `state.json`（`flock` 保护）协调全局令牌桶；两处的 `APT_REPO_RATE_*`
+  必须一致。状态文件损坏时自动重建（重建瞬间最多多放行一个 burst）。
 - **unsigned**：默认不签名；生产环境应补 `InRelease`/`Release.gpg`。
 - **下载与 GC 竞态**：响应通过已打开的 fd 流式发送，即使文件随后被 GC
   删除，进行中的下载仍能读到完整内容（POSIX inode 语义）。
@@ -128,9 +178,11 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest httpx
 uvicorn app.main:app --reload          # 数据写入 ./data
-pytest -q                              # 22 项测试
+pytest -q                              # 22 项发布测试 + 限流器/pool 服务测试
 ```
 
 测试覆盖：发布/回读、旧 Release 按哈希取旧索引与旧包、同名同版本重发、
 两版保留与第三版淘汰、坏包整批拒绝、错误架构拒绝、提交前中断回滚、
-提交后崩溃恢复、下载中被 GC、Release 格式与 by-hash 服务、路径穿越。
+提交后崩溃恢复、下载中被 GC、Release 格式与 by-hash 服务、路径穿越；
+共享限流器的速率上限/按 IP 平分/跨进程一致性与状态自愈、pool 服务的
+路径防护与限速响应。

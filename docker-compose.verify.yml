@@ -1,0 +1,42 @@
+# Verification add-on for the shared /pool/ rate cap.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.verify.yml ...
+#
+# Adds two client containers (two distinct source IPs on the compose
+# network) used by scripts/verify-shared-limit.sh, and renames the service
+# containers so the verification project can run next to a normal
+# deployment of the default compose file.
+
+services:
+  apt-repo:
+    container_name: apt-verify-repo
+
+  pool-a:
+    container_name: apt-verify-pool-a
+
+  pool-b:
+    container_name: apt-verify-pool-b
+
+  client1: &client-common
+    build: .
+    image: internal-apt-repo:latest
+    container_name: apt-verify-client1
+    init: true
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./tests:/tests:ro
+      - ./.verify-results:/results
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      - pool-a
+      - pool-b
+
+  client2:
+    <<: *client-common
+    container_name: apt-verify-client2

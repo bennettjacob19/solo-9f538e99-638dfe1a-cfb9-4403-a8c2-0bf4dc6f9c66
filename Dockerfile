@@ -20,8 +20,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 RUN useradd --system --uid 10001 --home-dir /srv --shell /usr/sbin/nologin aptrepo \
-    && mkdir -p /data \
-    && chown -R aptrepo:aptrepo /data /srv
+    && mkdir -p /data /limiter \
+    && chown -R aptrepo:aptrepo /data /limiter /srv
 
 USER 10001:10001
 VOLUME ["/data"]

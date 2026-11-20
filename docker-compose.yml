@@ -1,3 +1,53 @@
+# Internal APT repository: one publishing entry plus two independent,
+# rate-limited /pool/ download servers.
+#
+#   apt-repo   the original entry: publish (POST /api/publish) and metadata
+#   pool-a     independent /pool/ GET server  -> host port APT_POOL_A_PORT
+#   pool-b     independent /pool/ GET server  -> host port APT_POOL_B_PORT
+#
+# pool-a and pool-b mount the same data volume read-only and share one byte
+# rate cap (APT_REPO_RATE_BPS, burst APT_REPO_RATE_BURST) coordinated through
+# the apt-repo-limiter volume: in any interval the body bytes both commit to
+# connections together stay within rate*duration + burst, split fairly per
+# source IP (one IP = one share, even across both processes).
+
+x-pool-common: &pool-common
+  build: .
+  image: internal-apt-repo:latest
+  command: ["python", "-m", "app.pool_server"]
+  environment: &pool-environment
+    APT_REPO_DATA_DIR: /data
+    APT_REPO_LIMITER_DIR: /limiter
+    APT_REPO_POOL_PORT: "8081"
+    # The shared cap. Both pool processes MUST get identical values.
+    APT_REPO_RATE_BPS: "${APT_REPO_RATE_BPS:-4194304}"
+    APT_REPO_RATE_BURST: "${APT_REPO_RATE_BURST:-65536}"
+    APT_REPO_RATE_ACTIVE_TTL: "${APT_REPO_RATE_ACTIVE_TTL:-1.0}"
+  volumes:
+    - apt-repo-data:/data:ro
+    - apt-repo-limiter:/limiter
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  depends_on:
+    - apt-repo
+  # No restart policy on purpose: the verification kills one pool process and
+  # requires it to stay down while the peer keeps serving.
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2).status == 200 else 1)"
+    interval: 30s
+    timeout: 3s
+    retries: 3
+    start_period: 5s
+
 services:
   apt-repo:
     build: .
@@ -40,5 +90,20 @@ services:
     cap_drop:
       - ALL
 
+  pool-a:
+    <<: *pool-common
+    container_name: apt-pool-a
+    ports:
+      - "${APT_POOL_A_PORT:-8081}:8081"
+
+  pool-b:
+    <<: *pool-common
+    container_name: apt-pool-b
+    ports:
+      - "${APT_POOL_B_PORT:-8082}:8081"
+
 volumes:
   apt-repo-data:
+  # Shared token-bucket state for the pool servers (tiny JSON document,
+  # flock-coordinated). Ephemeral: the limiter self-heals from scratch.
+  apt-repo-limiter:
